@@ -96,7 +96,7 @@ Copy the autoconfig file from this repository into your RetroArch autoconfig dir
 
 ```bash
 mkdir -p ~/.config/retroarch/autoconfig
-cp "retroarch autoconfig/Wiimote Mode4 Virtual Pad.cfg" ~/.config/retroarch/autoconfig/
+cp "Wiimote Mode4 Virtual Pad.cfg" ~/.config/retroarch/autoconfig/
 ```
 
 If your repository uses a different folder name, adjust the source path accordingly.
@@ -209,6 +209,14 @@ sudo fuser -v /dev/hidraw*
 - LED sync
 - Better multi-Wiimote support
 - Cleaner per-emulator profiles
+
+## 🤖 AI Assistance
+
+This project was developed with the help of **ChatGPT**.
+
+The implementation, debugging, and reverse-engineering of the DolphinBar Mode 4 behavior were done through iterative testing and AI-assisted development.
+
+All code and behavior have been validated and tested in a real Linux environment.
 
 ## Credits
 
