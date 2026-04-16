@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+import os
+import re
+import time
+import glob
+import fcntl
+import struct
+import threading
+from collections import deque
+from typing import Dict, Optional
+
+from evdev import UInput, ecodes as e
+
+VENDOR = 0x057e
+PRODUCT = 0x0306
+READ_SIZE = 64
+HIDIOCGRAWINFO = 0x80084803
+
+SCAN_INTERVAL = 0.25
+LOGFILE = "/tmp/wiimote-mode4-daemon.log"
+
+# Based on your measured Mayflash rates:
+# connected: ~280-430 Hz
+# off/background: ~4 Hz
+RATE_WINDOW = 2.0
+CONNECT_HZ = 80.0
+DISCONNECT_HZ = 20.0
+
+CAP = {
+    e.EV_KEY: [
+        e.BTN_DPAD_UP,
+        e.BTN_DPAD_DOWN,
+        e.BTN_DPAD_LEFT,
+        e.BTN_DPAD_RIGHT,
+        e.BTN_SOUTH,   # A
+        e.BTN_EAST,    # B
+        e.BTN_WEST,    # 1
+        e.BTN_NORTH,   # 2
+        e.BTN_SELECT,  # Minus
+        e.BTN_START,   # Plus
+        e.BTN_MODE,    # Home
+    ],
+}
+
+def log(msg: str):
+    line = f"{time.strftime('%F %T')} {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOGFILE, "a", buffering=1) as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+def get_rawinfo(path: str):
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        buf = bytearray(8)
+        fcntl.ioctl(fd, HIDIOCGRAWINFO, buf, True)
+        bustype, vendor, product = struct.unpack("IHH", buf)
+        return bustype, vendor, product
+    finally:
+        os.close(fd)
+
+def hidraw_candidates():
+    out = []
+    for path in sorted(glob.glob("/dev/hidraw*"), key=lambda p: int(re.search(r'(\d+)$', p).group(1))):
+        try:
+            _, vendor, product = get_rawinfo(path)
+        except Exception:
+            continue
+        if vendor == VENDOR and product == PRODUCT:
+            out.append(path)
+    return out
+
+def interface_index_from_sysfs(path: str) -> Optional[int]:
+    name = os.path.basename(path)
+    sys_link = f"/sys/class/hidraw/{name}/device"
+    try:
+        real = os.path.realpath(sys_link)
+    except Exception:
+        return None
+    m = re.search(r':1\.(\d+)', real)
+    if m:
+        return int(m.group(1))
+    return None
+
+def decode_buttons(report: bytes) -> Dict[int, bool]:
+    if len(report) < 3:
+        return {}
+    if report[0] not in (0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37):
+        return {}
+    b1 = report[1]
+    b2 = report[2]
+    return {
+        e.BTN_SOUTH:      bool(b2 & 0x08),  # A
+        e.BTN_EAST:       bool(b2 & 0x04),  # B
+        e.BTN_WEST:       bool(b2 & 0x02),  # 1
+        e.BTN_NORTH:      bool(b2 & 0x01),  # 2
+        e.BTN_SELECT:     bool(b2 & 0x10),  # Minus
+        e.BTN_START:      bool(b1 & 0x10),  # Plus
+        e.BTN_MODE:       bool(b2 & 0x80),  # Home
+        e.BTN_DPAD_UP:    bool(b1 & 0x08),
+        e.BTN_DPAD_DOWN:  bool(b1 & 0x04),
+        e.BTN_DPAD_LEFT:  bool(b1 & 0x01),
+        e.BTN_DPAD_RIGHT: bool(b1 & 0x02),
+    }
+
+class DeviceWorker(threading.Thread):
+    def __init__(self, hidraw_path: str, slot: int):
+        super().__init__(daemon=True)
+        self.hidraw_path = hidraw_path
+        self.slot = slot
+        self.stop_event = threading.Event()
+        self.ui = None
+        self.fd = None
+        self.last_state: Dict[int, int] = {}
+        self.valid_times = deque()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def create_ui(self):
+        if self.ui is None:
+            self.ui = UInput(CAP, name="Wiimote Mode4 Virtual Pad", version=0x1)
+            self.last_state = {code: 0 for code in CAP[e.EV_KEY]}
+            log(f"[P{self.slot}] virtual pad created from {self.hidraw_path}")
+
+    def destroy_ui(self, reason: str):
+        if self.ui is not None:
+            try:
+                dirty = False
+                for code, value in list(self.last_state.items()):
+                    if value:
+                        self.ui.write(e.EV_KEY, code, 0)
+                        self.last_state[code] = 0
+                        dirty = True
+                if dirty:
+                    self.ui.syn()
+            except Exception:
+                pass
+            try:
+                self.ui.close()
+            except Exception:
+                pass
+            self.ui = None
+            self.last_state = {}
+            self.valid_times.clear()
+            log(f"[P{self.slot}] virtual pad removed: {reason}")
+
+    def valid_hz(self, now: float) -> float:
+        cutoff = now - RATE_WINDOW
+        while self.valid_times and self.valid_times[0] < cutoff:
+            self.valid_times.popleft()
+        return len(self.valid_times) / RATE_WINDOW
+
+    def run(self):
+        log(f"[P{self.slot}] worker starting for {self.hidraw_path}")
+        try:
+            self.fd = os.open(self.hidraw_path, os.O_RDONLY | os.O_NONBLOCK)
+            while not self.stop_event.is_set():
+                now = time.time()
+                try:
+                    report = os.read(self.fd, READ_SIZE)
+                except BlockingIOError:
+                    report = b""
+                except OSError as ex:
+                    log(f"[P{self.slot}] device gone/read failed on {self.hidraw_path}: {ex}")
+                    break
+
+                if report:
+                    state = decode_buttons(report)
+
+                    # Count every valid Wiimote report mode toward presence detection.
+                    if state:
+                        self.valid_times.append(now)
+
+                    hz = self.valid_hz(now)
+                    active = bool(state) and any(state.values())
+
+                    if self.ui is None and (hz >= CONNECT_HZ or active):
+                        self.create_ui()
+
+                    if self.ui is not None and state:
+                        dirty = False
+                        for code, pressed in state.items():
+                            value = 1 if pressed else 0
+                            if self.last_state.get(code) != value:
+                                self.ui.write(e.EV_KEY, code, value)
+                                self.last_state[code] = value
+                                dirty = True
+                        if dirty:
+                            self.ui.syn()
+
+                if self.ui is not None:
+                    hz = self.valid_hz(now)
+                    if hz > 0 and hz < DISCONNECT_HZ:
+                        self.destroy_ui(f"valid report rate dropped to {hz:.1f} Hz")
+
+                time.sleep(0.001)
+
+        except FileNotFoundError:
+            log(f"[P{self.slot}] hidraw disappeared before open: {self.hidraw_path}")
+        except Exception as ex:
+            log(f"[P{self.slot}] worker error for {self.hidraw_path}: {ex}")
+        finally:
+            try:
+                if self.fd is not None:
+                    os.close(self.fd)
+            except Exception:
+                pass
+            self.destroy_ui("worker stopped")
+            log(f"[P{self.slot}] worker stopped")
+
+class Manager:
+    def __init__(self):
+        self.workers_by_path: Dict[str, DeviceWorker] = {}
+
+    def desired_slots(self, paths):
+        indexed = []
+        fallback = []
+        for p in paths:
+            idx = interface_index_from_sysfs(p)
+            if idx is None:
+                fallback.append(p)
+            else:
+                indexed.append((idx, p))
+        indexed.sort(key=lambda x: x[0])
+        ordered = [p for _, p in indexed]
+        for p in sorted(fallback):
+            if p not in ordered:
+                ordered.append(p)
+        return {p: i for i, p in enumerate(ordered[:4], start=1)}
+
+    def run(self):
+        log("[manager] wiimote mode4 daemon started")
+        while True:
+            try:
+                paths = hidraw_candidates()
+                slot_map = self.desired_slots(paths)
+
+                for path, slot in slot_map.items():
+                    worker = self.workers_by_path.get(path)
+                    if worker is None or not worker.is_alive():
+                        if worker is not None:
+                            self.workers_by_path.pop(path, None)
+                        w = DeviceWorker(path, slot)
+                        self.workers_by_path[path] = w
+                        w.start()
+
+                for path in list(self.workers_by_path):
+                    if path not in slot_map:
+                        w = self.workers_by_path.pop(path)
+                        w.stop()
+
+            except Exception as ex:
+                log(f"[manager] scan error: {ex}")
+
+            time.sleep(SCAN_INTERVAL)
+
+if __name__ == "__main__":
+    Manager().run()
