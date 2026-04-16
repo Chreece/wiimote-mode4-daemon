@@ -7,6 +7,17 @@ This project is a small Linux daemon that bridges the gap between:
 - **Mayflash DolphinBar Mode 4** raw Wiimote HID input
 - **RetroArch** and other software that expect a normal Linux controller
 
+## 🎮 Supported Controllers
+
+This project has been tested with third-party / clone Wiimotes (commonly sold online).
+
+Example tested device:
+https://a.aliexpress.com/_EG3p118
+
+Many of these controllers behave differently from original Nintendo Wiimotes at the HID level, but this daemon handles their output correctly when used with the DolphinBar in Mode 4.
+
+> ⚠️ Note: Original Nintendo Wiimotes have not been tested yet.
+
 ## Features
 
 - Works with **Mayflash DolphinBar (Mode 4)**
