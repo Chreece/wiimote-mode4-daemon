@@ -7,9 +7,6 @@
 
 # 🎮 Wiimote Mode 4 (DolphinBar) → Virtual Gamepad (Linux)
 
-💙 **Enjoying this hobby project? [Send a voluntary thank-you via Ko-fi](https://ko-fi.com/chreece).**
-
-
 Use **Wiimotes on Linux** with the **Mayflash DolphinBar in Mode 4** by converting raw HID input into a virtual gamepad using `uinput`.
 
 This project is a small Linux daemon that bridges the gap between:
